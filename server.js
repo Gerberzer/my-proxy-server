@@ -4,121 +4,95 @@ const cors = require('cors');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const NZP_ORIGIN = 'https://nzp.gay'; // Define the origin for nzp.gay assets
 
 app.use(cors()); // Allow all cross-origin requests
 
-// Main proxy endpoint to fetch content from a target URL using /proxy?url=
-app.get('/proxy', async (req, res, next) => {
-    const targetUrl = req.query.url;
+// Universal request handler: This middleware will handle ALL incoming requests
+app.use(async (req, res, next) => {
+    // --- IMPORTANT DEBUGGING LOGS ---
+    console.log('\n--- Incoming Request ---');
+    console.log('Request Method:', req.method);
+    console.log('Request Original URL:', req.originalUrl); // This is the full path including query
+    console.log('Request Headers:', req.headers);
+    console.log('------------------------');
+    // --- END DEBUGGING LOGS ---
 
-    if (!targetUrl) {
-        return res.status(400).send('Error: Missing target URL. Please provide a URL in the "url" query parameter.');
+    // Decode the full URL path
+    const decodedUrl = decodeURIComponent(req.originalUrl);
+
+    // 1. Handle explicit /proxy requests
+    if (decodedUrl.startsWith('/proxy?url=')) {
+        const targetUrl = req.query.url; // Express parses query params automatically
+
+        if (!targetUrl) {
+            return res.status(400).send('Error: Missing target URL. Please provide a URL in the "url" query parameter.');
+        }
+        console.log(`[Proxy] Handling explicit request for: ${targetUrl}`);
+        await handleProxyRequest(targetUrl, req, res, next);
     }
-
-    console.log(`[Proxy] Explicit request for: ${targetUrl}`);
-
-    try {
-        const headersToForward = {};
-        for (const header in req.headers) {
-            if (!['host', 'connection', 'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto', 'via', 'cf-connecting-ip', 'true-client-ip', 'x-real-ip', 'x-cluster-client-ip', 'forwarded', 'x-forwarded-proto', 'x-forwarded-ssl', 'x-app-name', 'x-app-version', 'accept-encoding'].includes(header.toLowerCase())) {
-                headersToForward[header] = req.headers[header];
-            }
+    // 2. Handle asset requests (any other path)
+    else {
+        // Assume any other request is for an NZP asset
+        let assetPath = decodedUrl;
+        if (!assetPath.startsWith('/')) { // Ensure it starts with a slash
+            assetPath = '/' + assetPath;
         }
 
-        headersToForward['User-Agent'] = headersToForward['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-        headersToForward['Referer'] = headersToForward['referer'] || new URL(targetUrl).origin + '/';
-
-        const response = await axios({
-            method: 'get',
-            url: targetUrl,
-            responseType: 'stream',
-            headers: headersToForward,
-            maxRedirects: 5,
-            validateStatus: function (status) {
-                return status >= 200 && status < 300 || status === 404;
-            },
-        });
-
-        for (const header in response.headers) {
-            if (header.toLowerCase() !== 'set-cookie') {
-                 res.setHeader(header, response.headers[header]);
-            }
+        // Basic check to prevent proxying non-NZP assets if the client directly requests them from proxy root
+        // This is a safety measure; the browser should typically request NZP assets
+        if (!assetPath.includes('.')) { // Simple check for lack of file extension, could be a root request
+             console.warn(`[Asset Proxy] Request for root path or path without extension. Not proxying: ${assetPath}`);
+             return res.status(404).send('Not Found: Invalid asset path or unhandled request.');
         }
 
-        res.setHeader('Content-Type', response.headers['content-type'] || 'application/octet-stream');
-        res.status(response.status);
-        response.data.pipe(res);
-
-    } catch (error) {
-        console.error(`[Proxy Error] Explicit request ${targetUrl}:`, error.message);
-        next(error);
+        const targetAssetUrl = `${NZP_ORIGIN}${assetPath}`;
+        console.log(`[Asset Proxy] Handling asset request: ${targetAssetUrl}`);
+        await handleProxyRequest(targetAssetUrl, req, res, next, true); // Pass `true` for asset flag
     }
 });
 
-// Catch-all route for assets: This route will handle any request not matched by /proxy.
-// Using app.use() is generally more robust for wildcard paths than app.get()
-app.use('/*', async (req, res, next) => { // Changed to app.use
-    // --- IMPORTANT DEBUGGING LOGS ---
-    console.log('\n--- Incoming Asset Request ---');
-    console.log('Request Method:', req.method);
-    console.log('Request Path (from Express):', req.path);
-    console.log('Request Original URL (from Express):', req.originalUrl);
-    console.log('Request URL (from Express):', req.url);
-    console.log('Request Query Parameters:', req.query);
-    console.log('Request Headers:', req.headers);
-    console.log('------------------------------');
-    // --- END DEBUGGING LOGS ---
-
-    // Extract the path from req.url which includes the path and query string.
-    // decodeURIComponent to handle any URL-encoded characters.
-    let assetPath = decodeURIComponent(req.url);
-
-    // If the request is for the root path '/', it might be the main index.html for nzp.gay.
-    // However, the main /proxy route is already handling the initial nzp.gay load.
-    // This route should focus on subsequent asset requests from within the iframe.
-    // If it's a simple '/' request not matched by /proxy, it's usually favicon or similar,
-    // so we'll treat it as a request to nzp.gay's root.
-    if (assetPath === '/') {
-        assetPath = '/index.html'; // Default to index.html if bare root is requested
-    } else if (assetPath.startsWith('/proxy?url=')) {
-        // This case should ideally not happen if the /proxy route matches first,
-        // but as a safeguard, if we see the proxy pattern, we treat it as an explicit proxy request
-        // that somehow fell through, or a malformed request, and send 404.
-        console.warn(`[Asset Proxy] Unexpected '/proxy?url=' in asset path: ${assetPath}. Sending 404.`);
-        return res.status(404).send('Not Found: This path should be handled by the explicit /proxy route.');
-    }
-
-    // Ensure assetPath starts with a /
-    if (!assetPath.startsWith('/')) {
-        assetPath = '/' + assetPath;
-    }
-
-    const targetAssetUrl = `https://nzp.gay${assetPath}`;
-
-    console.log(`[Asset Proxy] Attempting to proxy asset: ${targetAssetUrl}`);
-
+/**
+ * Handles the actual proxying logic for both explicit /proxy calls and asset calls.
+ * @param {string} targetUrl - The URL to fetch from the internet.
+ * @param {object} req - Express request object.
+ * @param {object} res - Express response object.
+ * @param {function} next - Express next middleware function.
+ * @param {boolean} isAssetRequest - True if this is an asset request, used for specific header logic.
+ */
+async function handleProxyRequest(targetUrl, req, res, next, isAssetRequest = false) {
     try {
         const headersToForward = {};
         for (const header in req.headers) {
+            // Exclude hop-by-hop headers and potentially problematic ones
             if (!['host', 'connection', 'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto', 'via', 'cf-connecting-ip', 'true-client-ip', 'x-real-ip', 'x-cluster-client-ip', 'forwarded', 'x-forwarded-proto', 'x-forwarded-ssl', 'x-app-name', 'x-app-version', 'accept-encoding', 'if-none-match', 'if-modified-since'].includes(header.toLowerCase())) {
                 headersToForward[header] = req.headers[header];
             }
         }
 
+        // Strongly enforce User-Agent and Referer to match a direct browser request for nzp.gay
         headersToForward['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-        headersToForward['Referer'] = 'https://nzp.gay/';
-        headersToForward['Origin'] = 'https://nzp.gay';
+        headersToForward['Referer'] = NZP_ORIGIN + '/'; // Referer for nzp.gay
 
-        if (!headersToForward['Accept']) {
-            if (assetPath.includes('.js') || assetPath.includes('.mjs')) {
+        // Explicitly set Origin for asset requests from nzp.gay
+        if (isAssetRequest) {
+            headersToForward['Origin'] = NZP_ORIGIN;
+        } else {
+            // For explicit /proxy requests, the Origin should reflect the actual client (your HTML page)
+            headersToForward['Origin'] = req.headers['origin'] || null; // Use client's origin or null
+        }
+
+        // Add explicit Accept headers for common asset types based on file extension
+        if (isAssetRequest && !headersToForward['Accept']) {
+            if (targetUrl.includes('.js') || targetUrl.includes('.mjs')) {
                 headersToForward['Accept'] = 'application/javascript, */*;q=0.8';
-            } else if (assetPath.includes('.css')) {
+            } else if (targetUrl.includes('.css')) {
                 headersToForward['Accept'] = 'text/css, */*;q=0.8';
-            } else if (assetPath.includes('.wasm')) {
+            } else if (targetUrl.includes('.wasm')) {
                 headersToForward['Accept'] = 'application/wasm, application/x-wasm, */*;q=0.8';
-            } else if (assetPath.includes('.pk3')) {
+            } else if (targetUrl.includes('.pk3')) {
                 headersToForward['Accept'] = 'application/octet-stream, */*;q=0.8';
-            } else if (assetPath.includes('.')) {
+            } else if (targetUrl.includes('.')) {
                  headersToForward['Accept'] = 'image/*, audio/*, video/*, application/json, text/*, */*;q=0.8';
             } else {
                  headersToForward['Accept'] = '*/*';
@@ -127,51 +101,59 @@ app.use('/*', async (req, res, next) => { // Changed to app.use
 
         const response = await axios({
             method: 'get',
-            url: targetAssetUrl,
+            url: targetUrl,
             responseType: 'stream',
             headers: headersToForward,
             maxRedirects: 5,
             validateStatus: function (status) {
-                return status >= 200 && status < 300;
+                return status >= 200 && status < 300; // Only consider 2xx as success from target
             },
         });
 
+        // Forward all response headers from the target server back to the client
         for (const header in response.headers) {
             if (header.toLowerCase() !== 'set-cookie') {
                  res.setHeader(header, response.headers[header]);
             }
         }
 
+        // IMPORTANT: Override Content-Type if we suspect it's wrong (e.g., HTML for JS/WASM)
         const contentType = response.headers['content-type'] || 'application/octet-stream';
-        if (assetPath.includes('.js') && contentType.includes('text/html')) {
-            console.warn(`[Asset Proxy] MIME type mismatch detected for ${assetPath}. Overriding to application/javascript.`);
-            res.setHeader('Content-Type', 'application/javascript');
-        } else if (assetPath.includes('.wasm') && contentType.includes('text/html')) {
-            console.warn(`[Asset Proxy] MIME type mismatch detected for ${assetPath}. Overriding to application/wasm.`);
-            res.setHeader('Content-Type', 'application/wasm');
-        } else if (assetPath.includes('.pk3') && contentType.includes('text/html')) {
-            console.warn(`[Asset Proxy] MIME type mismatch detected for ${assetPath}. Overriding to application/octet-stream.`);
-            res.setHeader('Content-Type', 'application/octet-stream');
+        if (isAssetRequest) { // Only apply overrides for asset requests
+            if (targetUrl.includes('.js') && contentType.includes('text/html')) {
+                console.warn(`[Asset Proxy] MIME type mismatch detected for ${targetUrl}. Overriding to application/javascript.`);
+                res.setHeader('Content-Type', 'application/javascript');
+            } else if (targetUrl.includes('.wasm') && contentType.includes('text/html')) {
+                console.warn(`[Asset Proxy] MIME type mismatch detected for ${targetUrl}. Overriding to application/wasm.`);
+                res.setHeader('Content-Type', 'application/wasm');
+            } else if (targetUrl.includes('.pk3') && contentType.includes('text/html')) {
+                console.warn(`[Asset Proxy] MIME type mismatch detected for ${targetUrl}. Overriding to application/octet-stream.`);
+                res.setHeader('Content-Type', 'application/octet-stream');
+            } else {
+                res.setHeader('Content-Type', contentType);
+            }
         } else {
-            res.setHeader('Content-Type', contentType);
+            res.setHeader('Content-Type', contentType); // For non-asset requests, just forward original
         }
+
 
         res.status(response.status);
         response.data.pipe(res);
 
     } catch (error) {
-        console.error(`[Asset Proxy Error] for ${targetAssetUrl}:`, error.message);
+        console.error(`[Proxy Request Error] for ${targetUrl}:`, error.message);
         next(error); // Pass the error to the next error handling middleware
     }
-});
+}
 
 // IMPORTANT: Generic error handling middleware
 // This must be placed AFTER all other app.use() and app.get() routes
 app.use((err, req, res, next) => {
     console.error('\n--- CAUGHT EXPRESS ERROR ---');
-    console.error('Request URL:', req.originalUrl);
-    console.error('Error Stack:', err.stack);
+    console.error('Error Type:', err.name);
     console.error('Error Message:', err.message);
+    console.error('Request URL:', req.originalUrl); // This will show the exact URL that caused the problem
+    console.error('Error Stack:', err.stack);
     console.error('----------------------------');
 
     if (res.headersSent) {
@@ -179,6 +161,7 @@ app.use((err, req, res, next) => {
     }
     res.status(500).send('An internal proxy server error occurred. Check server logs for details.');
 });
+
 
 app.listen(PORT, () => {
     console.log(`Proxy server running on port ${PORT}`);
