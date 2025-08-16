@@ -17,22 +17,22 @@ app.get('/proxy', async (req, res) => {
     console.log(`Proxying request for: ${targetUrl}`);
 
     try {
-        // Construct headers to forward from the client (browser) to the target server
-        // Exclude headers that might cause issues or are specific to the client's direct connection
-        const forwardedHeaders = {};
+        // Prepare headers to forward from the client (browser) to the target server
+        // Filter out hop-by-hop headers and potentially problematic ones
+        const headersToForward = {};
         for (const header in req.headers) {
-            // Exclude connection-specific headers, host, etc.
-            if (!['host', 'connection', 'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto', 'via'].includes(header.toLowerCase())) {
-                forwardedHeaders[header] = req.headers[header];
+            if (!['host', 'connection', 'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto', 'via', 'cf-connecting-ip', 'true-client-ip', 'x-real-ip', 'x-cluster-client-ip', 'forwarded', 'x-forwarded-proto', 'x-forwarded-ssl', 'x-app-name', 'x-app-version'].includes(header.toLowerCase())) {
+                headersToForward[header] = req.headers[header];
             }
         }
 
-        // Use axios to make the HTTP request to the target URL
-        // Set `responseType: 'arraybuffer'` to handle all binary and text content
-        // Pass along the forwarded headers
-        const response = await axios.get(targetUrl, {
-            responseType: 'arraybuffer',
-            headers: forwardedHeaders, // Forward client headers to the target
+        // Make the request to the target URL, stream the response
+        const response = await axios({
+            method: 'get',
+            url: targetUrl,
+            responseType: 'stream', // Crucial for streaming content
+            headers: headersToForward, // Forward client headers
+            maxRedirects: 5, // Ensure redirects are followed automatically
         });
 
         // Forward all response headers from the target server back to the client
@@ -40,17 +40,17 @@ app.get('/proxy', async (req, res) => {
             res.setHeader(header, response.headers[header]);
         }
 
-        // Send the data received from the target website back to the client
-        res.status(response.status).send(response.data);
+        // Pipe the response stream directly to the client
+        response.data.pipe(res);
 
     } catch (error) {
         console.error(`Error proxying ${targetUrl}:`, error.message);
         if (error.response) {
             // If the error has a response from the target server, forward its status and data
             res.status(error.response.status);
-            // Try to send the original error data if it's text, otherwise send generic error
-            if (error.response.headers['content-type'] && error.response.headers['content-type'].includes('text')) {
-                res.send(error.response.data.toString());
+            // If it's a stream, try to pipe it or just send a string error
+            if (error.response.data && typeof error.response.data.pipe === 'function') {
+                error.response.data.pipe(res); // Pipe the error stream
             } else {
                 res.send(`Error from target server (${error.response.status}): ${error.message}`);
             }
