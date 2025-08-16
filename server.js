@@ -18,13 +18,18 @@ app.get('/proxy', async (req, res) => {
 
     try {
         // Prepare headers to forward from the client (browser) to the target server
-        // Filter out hop-by-hop headers and potentially problematic ones
         const headersToForward = {};
         for (const header in req.headers) {
-            if (!['host', 'connection', 'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto', 'via', 'cf-connecting-ip', 'true-client-ip', 'x-real-ip', 'x-cluster-client-ip', 'forwarded', 'x-forwarded-proto', 'x-forwarded-ssl', 'x-app-name', 'x-app-version'].includes(header.toLowerCase())) {
+            // Exclude hop-by-hop headers and potentially problematic ones that Axios or Render might add
+            if (!['host', 'connection', 'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto', 'via', 'cf-connecting-ip', 'true-client-ip', 'x-real-ip', 'x-cluster-client-ip', 'forwarded', 'x-forwarded-proto', 'x-forwarded-ssl', 'x-app-name', 'x-app-version', 'accept-encoding'].includes(header.toLowerCase())) {
                 headersToForward[header] = req.headers[header];
             }
         }
+
+        // Add an explicit User-Agent to make the proxy request look more like a real browser
+        // Also add a Referer header, which some sites check
+        headersToForward['User-Agent'] = headersToForward['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+        headersToForward['Referer'] = headersToForward['referer'] || new URL(targetUrl).origin + '/'; // Set referer to target origin
 
         // Make the request to the target URL, stream the response
         const response = await axios({
@@ -33,12 +38,22 @@ app.get('/proxy', async (req, res) => {
             responseType: 'stream', // Crucial for streaming content
             headers: headersToForward, // Forward client headers
             maxRedirects: 5, // Ensure redirects are followed automatically
+            validateStatus: function (status) {
+                return status >= 200 && status < 300 || status === 404; // Accept 404s so we can pass them through
+            },
         });
 
         // Forward all response headers from the target server back to the client
         for (const header in response.headers) {
-            res.setHeader(header, response.headers[header]);
+            // Remove 'set-cookie' if it causes issues, or modify it
+            if (header.toLowerCase() !== 'set-cookie') { // Example: remove Set-Cookie headers
+                 res.setHeader(header, response.headers[header]);
+            }
         }
+
+        // Explicitly set Content-Type header based on Axios's response headers, or default
+        // This is crucial for the browser to correctly interpret the file type
+        res.setHeader('Content-Type', response.headers['content-type'] || 'application/octet-stream'); // Fallback if no content-type is provided
 
         // Pipe the response stream directly to the client
         response.data.pipe(res);
@@ -46,11 +61,12 @@ app.get('/proxy', async (req, res) => {
     } catch (error) {
         console.error(`Error proxying ${targetUrl}:`, error.message);
         if (error.response) {
-            // If the error has a response from the target server, forward its status and data
             res.status(error.response.status);
-            // If it's a stream, try to pipe it or just send a string error
+            // If the error response is a stream, pipe it; otherwise, send message
             if (error.response.data && typeof error.response.data.pipe === 'function') {
-                error.response.data.pipe(res); // Pipe the error stream
+                // Ensure proper content type for error response as well
+                res.setHeader('Content-Type', error.response.headers['content-type'] || 'text/plain');
+                error.response.data.pipe(res);
             } else {
                 res.send(`Error from target server (${error.response.status}): ${error.message}`);
             }
