@@ -1,58 +1,66 @@
-// Import necessary modules
-const express = require('express'); // For creating the web server
-const axios = require('axios');     // For making HTTP requests to target websites
-const cors = require('cors');       // For handling Cross-Origin Resource Sharing
+const express = require('express');
+const axios = require('axios');
+const cors = require('cors');
 
-const app = express(); // Initialize Express application
-const PORT = process.env.PORT || 3000; // Define the port for the server, default to 3000
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-// Use CORS middleware to allow requests from any origin (important for client-side to connect)
-app.use(cors());
+app.use(cors()); // Allow all cross-origin requests
 
-// Serve static files from a 'public' directory (if you want to host your HTML here)
-// app.use(express.static('public')); 
-
-/**
- * Proxy endpoint to fetch content from a target URL.
- * It takes 'url' as a query parameter (e.g., /proxy?url=https://example.com).
- */
 app.get('/proxy', async (req, res) => {
-    const targetUrl = req.query.url; // Get the target URL from the query parameter
+    const targetUrl = req.query.url;
 
     if (!targetUrl) {
-        // If no URL is provided, send an error response
         return res.status(400).send('Error: Missing target URL. Please provide a URL in the "url" query parameter.');
     }
 
-    console.log(`Proxying request for: ${targetUrl}`); // Log the request for debugging
+    console.log(`Proxying request for: ${targetUrl}`);
 
     try {
-        // Use axios to make the HTTP request to the target URL
-        // `responseType: 'arraybuffer'` is used to handle various content types (HTML, images, etc.)
-        const response = await axios.get(targetUrl, { responseType: 'arraybuffer' });
+        // Construct headers to forward from the client (browser) to the target server
+        // Exclude headers that might cause issues or are specific to the client's direct connection
+        const forwardedHeaders = {};
+        for (const header in req.headers) {
+            // Exclude connection-specific headers, host, etc.
+            if (!['host', 'connection', 'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto', 'via'].includes(header.toLowerCase())) {
+                forwardedHeaders[header] = req.headers[header];
+            }
+        }
 
-        // Set the appropriate Content-Type header based on the target website's response
-        // This is crucial for the browser to correctly render different types of content
-        res.setHeader('Content-Type', response.headers['content-type'] || 'text/html');
+        // Use axios to make the HTTP request to the target URL
+        // Set `responseType: 'arraybuffer'` to handle all binary and text content
+        // Pass along the forwarded headers
+        const response = await axios.get(targetUrl, {
+            responseType: 'arraybuffer',
+            headers: forwardedHeaders, // Forward client headers to the target
+        });
+
+        // Forward all response headers from the target server back to the client
+        for (const header in response.headers) {
+            res.setHeader(header, response.headers[header]);
+        }
 
         // Send the data received from the target website back to the client
-        res.send(response.data);
+        res.status(response.status).send(response.data);
 
     } catch (error) {
-        console.error(`Error proxying ${targetUrl}:`, error.message); // Log any errors
+        console.error(`Error proxying ${targetUrl}:`, error.message);
         if (error.response) {
-            // If the error has a response from the target server
-            res.status(error.response.status).send(`Error from target server (${error.response.status}): ${error.message}`);
+            // If the error has a response from the target server, forward its status and data
+            res.status(error.response.status);
+            // Try to send the original error data if it's text, otherwise send generic error
+            if (error.response.headers['content-type'] && error.response.headers['content-type'].includes('text')) {
+                res.send(error.response.data.toString());
+            } else {
+                res.send(`Error from target server (${error.response.status}): ${error.message}`);
+            }
         } else {
-            // Generic error for network issues or invalid URLs
             res.status(500).send(`Proxy Error: Could not reach target URL or unexpected error: ${error.message}`);
         }
     }
 });
 
-// Start the server and listen on the defined port
 app.listen(PORT, () => {
     console.log(`Proxy server running on port ${PORT}`);
     console.log(`Access it at: http://localhost:${PORT}/proxy?url=https://example.com`);
-    console.log('Remember to configure port forwarding if running from home for external access.');
 });
