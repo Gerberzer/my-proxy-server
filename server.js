@@ -8,7 +8,7 @@ const PORT = process.env.PORT || 3000;
 app.use(cors()); // Allow all cross-origin requests
 
 // Main proxy endpoint to fetch content from a target URL using /proxy?url=
-app.get('/proxy', async (req, res, next) => { // Added next for error handling
+app.get('/proxy', async (req, res, next) => {
     const targetUrl = req.query.url;
 
     if (!targetUrl) {
@@ -18,7 +18,6 @@ app.get('/proxy', async (req, res, next) => { // Added next for error handling
     console.log(`[Proxy] Explicit request for: ${targetUrl}`);
 
     try {
-        // Prepare headers to forward from the client (browser) to the target server
         const headersToForward = {};
         for (const header in req.headers) {
             if (!['host', 'connection', 'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto', 'via', 'cf-connecting-ip', 'true-client-ip', 'x-real-ip', 'x-cluster-client-ip', 'forwarded', 'x-forwarded-proto', 'x-forwarded-ssl', 'x-app-name', 'x-app-version', 'accept-encoding'].includes(header.toLowerCase())) {
@@ -26,7 +25,6 @@ app.get('/proxy', async (req, res, next) => { // Added next for error handling
             }
         }
 
-        // Add an explicit User-Agent and Referer header
         headersToForward['User-Agent'] = headersToForward['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
         headersToForward['Referer'] = headersToForward['referer'] || new URL(targetUrl).origin + '/';
 
@@ -53,15 +51,13 @@ app.get('/proxy', async (req, res, next) => { // Added next for error handling
 
     } catch (error) {
         console.error(`[Proxy Error] Explicit request ${targetUrl}:`, error.message);
-        // Pass the error to the next error handling middleware
         next(error);
     }
 });
 
-// Catch-all route for assets: If a request doesn't start with '/proxy',
-// assume it's an asset (like /ftewebgl.js or /nzp/game.pk3) from nzp.gay
-// Use '/*' to match any path after the root
-app.get('/*', async (req, res, next) => { // Added next for error handling
+// Catch-all route for assets: This route will handle any request not matched by /proxy.
+// Using app.use() is generally more robust for wildcard paths than app.get()
+app.use('/*', async (req, res, next) => { // Changed to app.use
     // --- IMPORTANT DEBUGGING LOGS ---
     console.log('\n--- Incoming Asset Request ---');
     console.log('Request Method:', req.method);
@@ -73,16 +69,26 @@ app.get('/*', async (req, res, next) => { // Added next for error handling
     console.log('------------------------------');
     // --- END DEBUGGING LOGS ---
 
-    // Use req.url which includes the path and query string, then decode it
+    // Extract the path from req.url which includes the path and query string.
+    // decodeURIComponent to handle any URL-encoded characters.
     let assetPath = decodeURIComponent(req.url);
 
-    // Ensure assetPath doesn't contain the /proxy part if it somehow got there
-    if (assetPath.startsWith('/proxy?url=')) {
-        console.warn(`[Asset Proxy] Unexpected '/proxy?url=' in asset path: ${assetPath}. Skipping this request for generic asset handling.`);
-        return res.status(404).send('Not Found: This path should not be handled as a generic asset.');
+    // If the request is for the root path '/', it might be the main index.html for nzp.gay.
+    // However, the main /proxy route is already handling the initial nzp.gay load.
+    // This route should focus on subsequent asset requests from within the iframe.
+    // If it's a simple '/' request not matched by /proxy, it's usually favicon or similar,
+    // so we'll treat it as a request to nzp.gay's root.
+    if (assetPath === '/') {
+        assetPath = '/index.html'; // Default to index.html if bare root is requested
+    } else if (assetPath.startsWith('/proxy?url=')) {
+        // This case should ideally not happen if the /proxy route matches first,
+        // but as a safeguard, if we see the proxy pattern, we treat it as an explicit proxy request
+        // that somehow fell through, or a malformed request, and send 404.
+        console.warn(`[Asset Proxy] Unexpected '/proxy?url=' in asset path: ${assetPath}. Sending 404.`);
+        return res.status(404).send('Not Found: This path should be handled by the explicit /proxy route.');
     }
 
-    // Ensure it starts with a / for URL construction, but avoid double slashes
+    // Ensure assetPath starts with a /
     if (!assetPath.startsWith('/')) {
         assetPath = '/' + assetPath;
     }
@@ -94,18 +100,15 @@ app.get('/*', async (req, res, next) => { // Added next for error handling
     try {
         const headersToForward = {};
         for (const header in req.headers) {
-            // Be very selective here. Only forward headers that are universally safe.
             if (!['host', 'connection', 'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto', 'via', 'cf-connecting-ip', 'true-client-ip', 'x-real-ip', 'x-cluster-client-ip', 'forwarded', 'x-forwarded-proto', 'x-forwarded-ssl', 'x-app-name', 'x-app-version', 'accept-encoding', 'if-none-match', 'if-modified-since'].includes(header.toLowerCase())) {
                 headersToForward[header] = req.headers[header];
             }
         }
 
-        // Strongly enforce User-Agent and Referer to match a direct browser request for nzp.gay
         headersToForward['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
         headersToForward['Referer'] = 'https://nzp.gay/';
-        headersToForward['Origin'] = 'https://nzp.gay'; // Explicitly set Origin for assets
+        headersToForward['Origin'] = 'https://nzp.gay';
 
-        // Add explicit Accept headers for common asset types based on file extension
         if (!headersToForward['Accept']) {
             if (assetPath.includes('.js') || assetPath.includes('.mjs')) {
                 headersToForward['Accept'] = 'application/javascript, */*;q=0.8';
@@ -158,8 +161,7 @@ app.get('/*', async (req, res, next) => { // Added next for error handling
 
     } catch (error) {
         console.error(`[Asset Proxy Error] for ${targetAssetUrl}:`, error.message);
-        // Pass the error to the next error handling middleware
-        next(error);
+        next(error); // Pass the error to the next error handling middleware
     }
 });
 
@@ -172,13 +174,11 @@ app.use((err, req, res, next) => {
     console.error('Error Message:', err.message);
     console.error('----------------------------');
 
-    // Send a generic error response to the client
     if (res.headersSent) {
         return next(err); // Delegate to default error handler if headers are already sent
     }
     res.status(500).send('An internal proxy server error occurred. Check server logs for details.');
 });
-
 
 app.listen(PORT, () => {
     console.log(`Proxy server running on port ${PORT}`);
