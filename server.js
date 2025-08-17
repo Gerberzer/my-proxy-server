@@ -31,24 +31,36 @@ app.use(async (req, res, next) => {
         console.log(`[Proxy] Handling explicit request for: ${targetUrl}`);
         await handleProxyRequest(targetUrl, req, res, next);
     }
-    // 2. Handle asset requests (any other path)
+    // 2. Handle asset requests (any other path, including root)
     else {
-        // Assume any other request is for an NZP asset
         let assetPath = decodedUrl;
         if (!assetPath.startsWith('/')) { // Ensure it starts with a slash
             assetPath = '/' + assetPath;
         }
 
-        // Basic check to prevent proxying non-NZP assets if the client directly requests them from proxy root
-        // This is a safety measure; the browser should typically request NZP assets
-        if (!assetPath.includes('.')) { // Simple check for lack of file extension, could be a root request
-             console.warn(`[Asset Proxy] Request for root path or path without extension. Not proxying: ${assetPath}`);
-             return res.status(404).send('Not Found: Invalid asset path or unhandled request.');
+        // --- MODIFIED LOGIC HERE ---
+        // Allow the root path '/' to be proxied.
+        // For other paths, maintain a check if they are likely assets.
+        if (assetPath === '/') {
+            // Proxy the root path to nzp.gay's root
+            const targetAssetUrl = `${NZP_ORIGIN}/`;
+            console.log(`[Asset Proxy] Handling root path request: ${targetAssetUrl}`);
+            await handleProxyRequest(targetAssetUrl, req, res, next, true); // Pass `true` for asset flag
+        } else if (!assetPath.includes('.')) {
+            // If it's not the root path and has no extension, it's still likely an unhandled non-asset.
+            console.warn(`[Asset Proxy] Request for path without extension (not root). Not proxying: ${assetPath}`);
+            return res.status(404).send('Not Found: Invalid asset path or unhandled request.');
+        } else if (assetPath.startsWith('/proxy?url=')) {
+            // This case should ideally not happen but as a safeguard
+            console.warn(`[Asset Proxy] Unexpected '/proxy?url=' in asset path: ${assetPath}. Sending 404.`);
+            return res.status(404).send('Not Found: This path should be handled by the explicit /proxy route.');
         }
-
-        const targetAssetUrl = `${NZP_ORIGIN}${assetPath}`;
-        console.log(`[Asset Proxy] Handling asset request: ${targetAssetUrl}`);
-        await handleProxyRequest(targetAssetUrl, req, res, next, true); // Pass `true` for asset flag
+        else {
+            // Default asset handling for paths with extensions
+            const targetAssetUrl = `${NZP_ORIGIN}${assetPath}`;
+            console.log(`[Asset Proxy] Handling asset request: ${targetAssetUrl}`);
+            await handleProxyRequest(targetAssetUrl, req, res, next, true); // Pass `true` for asset flag
+        }
     }
 });
 
